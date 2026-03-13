@@ -63,6 +63,33 @@ class ServiceFeeSettingsForm(SettingsForm):
         required=False
     )
 
+    # Default per-product fee (amount + percent, applied per product line; product can override)
+    service_fee_product_amount = forms.DecimalField(
+        label=_("Default per-product fee (amount)"),
+        help_text=_(
+            "Optional fee in currency per product line. Can be overridden per product."
+        ),
+        required=False,
+    )
+    service_fee_product_percent = forms.DecimalField(
+        label=_("Default per-product fee (percent)"),
+        help_text=_(
+            "Optional percentage of the line total. Can be overridden per product."
+        ),
+        required=False,
+    )
+    service_fee_product_mode = forms.ChoiceField(
+        label=_("Default per-product fee mode"),
+        choices=(
+            ("add", _("Added to the product price")),
+            ("include", _("Included in the product price")),
+        ),
+        help_text=_(
+            "Added: the fee is shown as a separate line. Included: the product price already contains the fee; no extra line."
+        ),
+        required=False,
+    )
+
     service_fee_abs_resellers = forms.DecimalField(
         label=_("Fixed fee per order"), required=False
     )

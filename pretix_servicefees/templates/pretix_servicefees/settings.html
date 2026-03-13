@@ -18,6 +18,17 @@
             {% bootstrap_field form.service_fee_skip_if_gift_card layout="control" %}
         </fieldset>
         <fieldset>
+          <legend>{% trans "Per-product fee (default)" %}</legend>
+            <p class="help-block">
+                {% blocktrans trimmed %}
+                    Optional fee applied per product line (amount and/or percent). Each product can override this or use the default below. Choose whether the fee is added to the product price (separate line) or included in the product price (no extra line).
+                {% endblocktrans %}
+            </p>
+            {% bootstrap_field form.service_fee_product_amount addon_after=request.event.currency layout="control" %}
+            {% bootstrap_field form.service_fee_product_percent addon_after="%" layout="control" %}
+            {% bootstrap_field form.service_fee_product_mode layout="control" %}
+        </fieldset>
+        <fieldset>
           <legend>{% trans "Service fees with resellers" %}</legend>
             <p>
                 {% trans "If you keep values empty, we will fall back to the values from above. If you do not want to charge any fees through this sales channel, set them to zero explicity." %}

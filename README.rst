@@ -1,7 +1,14 @@
 pretix Service Fees
 ==========================
 
-This is a plugin for `pretix`_. 
+This is a plugin for `pretix`_.
+
+Features
+--------
+
+- **Order-level service fee**: Fixed fee per order, percentual fee per order, and/or fixed fee per ticket (with options to skip free products, add-ons, non-admission products, gift-card-paid amounts).
+- **Per-product fee (default)**: Optional default fee per product line (amount and/or percent). Event setting: "Per-product fee (default)" with mode **Add to product price** (fee as separate line) or **Include in product price** (no extra line; customer pays listed price only).
+- **Per-product override**: On each product's edit page, **Service fee** section: "Exclude this product from order-level fees" and "Use custom per-product fee" with amount, percent, and mode. Product overrides replace the event default for that product.
 
 Development setup
 -----------------

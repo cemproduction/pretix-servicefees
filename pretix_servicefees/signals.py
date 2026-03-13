@@ -26,7 +26,7 @@ from pretix.presale.signals import (
 from pretix.presale.views import get_cart
 from pretix.presale.views.cart import cart_session
 
-from .models import ItemServicefeesSettings
+from .models import FEE_MODE_ADD, ItemServicefeesSettings
 
 
 @receiver(nav_event_settings, dispatch_uid="service_fee_nav_settings")
@@ -60,6 +60,8 @@ def get_fees(
 ):
     if request is not None and not positions:
         positions = get_cart(request)
+
+    all_positions = list(positions)
 
     explicitly_excluded_products = set(
         ItemServicefeesSettings.objects.filter(
@@ -136,6 +138,8 @@ def get_fees(
             ):
                 total = max(0, total_for_percentages - Decimal(p["max_value"] or "0"))
 
+    fees = []
+
     if (fee_per_ticket or fee_abs or fee_percent) and total_for_percentages != Decimal("0.00"):
         fee = round_decimal(
             fee_abs + total_for_percentages * (fee_percent / 100) + len(positions) * fee_per_ticket,
@@ -150,7 +154,6 @@ def get_fees(
         else:
             fee_values = [(tax_rule_zero, fee)]
 
-        fees = []
         for tax_rule, price in fee_values:
             tax_rule = tax_rule or tax_rule_zero
             tax = tax_rule.tax(
@@ -167,9 +170,75 @@ def get_fees(
                     tax_rule=tax_rule,
                 )
             )
-        return fees
 
-    return []
+    # Per-product fee (amount + percent per line; "add" mode only adds an OrderFee)
+    product_fee_total = Decimal("0.00")
+    item_settings_map = {
+        s.item_id: s
+        for s in ItemServicefeesSettings.objects.filter(
+            item__event=event
+        ).select_related("item")
+    }
+    default_amount = event.settings.get("service_fee_product_amount", as_type=Decimal) or Decimal("0.00")
+    default_percent = event.settings.get("service_fee_product_percent", as_type=Decimal) or Decimal("0.00")
+    default_mode = event.settings.get("service_fee_product_mode", as_type=str) or FEE_MODE_ADD
+
+    for pos in all_positions:
+        item_setting = item_settings_map.get(pos.item_id)
+        if item_setting is not None and (
+            item_setting.fee_amount is not None
+            or item_setting.fee_percent is not None
+            or item_setting.fee_mode is not None
+        ):
+            amount = item_setting.fee_amount if item_setting.fee_amount is not None else Decimal("0.00")
+            percent = item_setting.fee_percent if item_setting.fee_percent is not None else Decimal("0.00")
+            mode = item_setting.fee_mode or default_mode
+        else:
+            amount = default_amount
+            percent = default_percent
+            mode = default_mode
+
+        if amount == Decimal("0.00") and percent == Decimal("0.00"):
+            continue
+        if mode != FEE_MODE_ADD:
+            continue
+
+        qty = getattr(pos, "count", getattr(pos, "quantity", 1))
+        # Line total: CartPosition/OrderPosition use gross_price_before_rounding as line total, else price * qty
+        line_gross = getattr(pos, "gross_price_before_rounding", None)
+        if line_gross is None:
+            line_gross = getattr(pos, "price", Decimal("0.00")) * qty
+        line_fee = (amount * qty) + (line_gross * percent / 100)
+        product_fee_total += line_fee
+
+    if product_fee_total > Decimal("0.00"):
+        product_fee_total = round_decimal(product_fee_total, event.currency)
+        tax_rule_zero = TaxRule.zero()
+        tax_rule = (
+            event.cached_default_tax_rule or tax_rule_zero
+            if event.settings.service_fee_tax_rule == "default"
+            else tax_rule_zero
+        )
+        tax_rule = tax_rule or tax_rule_zero
+        tax = tax_rule.tax(
+            product_fee_total,
+            invoice_address=invoice_address,
+            base_price_is="gross",
+        )
+        fees.append(
+            OrderFee(
+                fee_type=OrderFee.FEE_TYPE_SERVICE,
+                internal_type="servicefees_product",
+                description=gettext("Per-product fee"),
+                value=product_fee_total,
+                tax_rate=tax.rate,
+                tax_code=tax.code,
+                tax_value=tax.tax,
+                tax_rule=tax_rule,
+            )
+        )
+
+    return fees
 
 
 @receiver(fee_calculation_for_cart, dispatch_uid="service_fee_calc_cart")
@@ -277,23 +346,49 @@ def order_meta_signal(sender: Event, request: HttpRequest, **kwargs):
 
 
 class ItemServicefeesSettingsForm(forms.ModelForm):
+    use_custom_product_fee = forms.BooleanField(
+        label=_("Use custom per-product fee for this product"),
+        required=False,
+    )
+
     class Meta:
         model = ItemServicefeesSettings
-        fields = ["exclude"]
+        fields = ["exclude", "fee_amount", "fee_percent", "fee_mode"]
         exclude = []
 
     def __init__(self, *args, **kwargs):
         self.event = kwargs.pop("event")
         super().__init__(*args, **kwargs)
+        self.fields["fee_amount"].required = False
+        self.fields["fee_percent"].required = False
+        self.fields["fee_mode"].required = False
+        self.fields["fee_amount"].widget.attrs["placeholder"] = self.event.currency
+        if self.instance.pk:
+            self.fields["use_custom_product_fee"].initial = (
+                self.instance.fee_amount is not None
+                or self.instance.fee_percent is not None
+                or self.instance.fee_mode is not None
+            )
 
     def save(self, commit=True):
-        if not self.cleaned_data.get("exclude"):
+        use_custom = self.cleaned_data.get("use_custom_product_fee")
+        exclude = self.cleaned_data.get("exclude")
+
+        if not exclude and not use_custom:
             if self.instance.pk:
                 self.instance.delete()
-            else:
-                return
+            return None
+
+        self.instance.exclude = exclude
+        if use_custom:
+            self.instance.fee_amount = self.cleaned_data.get("fee_amount") or None
+            self.instance.fee_percent = self.cleaned_data.get("fee_percent") or None
+            self.instance.fee_mode = self.cleaned_data.get("fee_mode") or None
         else:
-            return super().save(commit=commit)
+            self.instance.fee_amount = None
+            self.instance.fee_percent = None
+            self.instance.fee_mode = None
+        return super().save(commit=commit)
 
 
 @receiver(item_forms, dispatch_uid="servicefees_item_forms")
@@ -302,12 +397,14 @@ def control_item_forms(sender, request, item, **kwargs):
         inst = ItemServicefeesSettings.objects.get(item=item)
     except ItemServicefeesSettings.DoesNotExist:
         inst = ItemServicefeesSettings(item=item)
-    return ItemServicefeesSettingsForm(
+    form = ItemServicefeesSettingsForm(
         instance=inst,
         event=sender,
         data=(request.POST if request.method == "POST" else None),
         prefix="servicefees",
     )
+    form.title = _("Service fee")
+    return form
 
 
 @receiver(item_copy_data, dispatch_uid="servicefees_item_copy")
@@ -325,13 +422,13 @@ def copy_item(sender, source, target, **kwargs):
 @receiver(signal=event_copy_data, dispatch_uid="servicefees_copy_data")
 def event_copy_data_receiver(sender, other, question_map, item_map, **kwargs):
     for ip in ItemServicefeesSettings.objects.filter(item__event=other):
-        ip = copy.copy(ip)
-        ip.pk = None
-        ip.event = sender
-        ip.item = item_map[ip.item_id]
-        ip.save()
+        ip_copy = copy.copy(ip)
+        ip_copy.pk = None
+        ip_copy.item = item_map[ip.item_id]
+        ip_copy.save()
 
 
 settings_hierarkey.add_default("service_fee_skip_addons", "True", bool)
 settings_hierarkey.add_default("service_fee_skip_free", "True", bool)
-settings_hierarkey.add_default('service_fee_tax_rule', 'default', str)
+settings_hierarkey.add_default("service_fee_tax_rule", "default", str)
+settings_hierarkey.add_default("service_fee_product_mode", "add", str)
