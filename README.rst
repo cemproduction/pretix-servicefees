@@ -10,6 +10,25 @@ Features
 - **Per-product fee (default)**: Optional default fee per product line (amount and/or percent). Event setting: "Per-product fee (default)" with mode **Add to product price** (fee as separate line) or **Include in product price** (no extra line; customer pays listed price only).
 - **Per-product override**: On each product's edit page, **Service fee** section: "Exclude this product from order-level fees" and "Use custom per-product fee" with amount, percent, and mode. Product overrides replace the event default for that product.
 
+For plugin developers: per-position fee data
+--------------------------------------------
+
+When per-product fees are applied, this plugin stores the **gross fee amount per order position** in the order's ``meta_info`` so other plugins can build exports or reports (e.g. fee by product for the whole event).
+
+**Public API** (use this instead of reading ``meta_info`` directly):
+
+.. code-block:: python
+
+   from pretix_servicefees import get_order_position_fees, META_KEY_POSITION_FEES
+
+   # Get fee per position for one order (position_id -> Decimal)
+   fee_by_position = get_order_position_fees(order)
+
+   # Or read the raw dict: order.meta_info[META_KEY_POSITION_FEES]
+   # Format: {str(position_id): "2.50", ...}  (only positions with fee > 0)
+
+**When the data is present**: Set on order placement; removed on order change; on order split, only the original order keeps fees for positions that stayed (the new order has no fee data for moved positions). See ``pretix_servicefees.position_fees`` module docstring for the full contract and an event-level aggregation example.
+
 Development setup
 -----------------
 

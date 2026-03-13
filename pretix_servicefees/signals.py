@@ -1,4 +1,5 @@
 import copy
+import threading
 from collections import defaultdict
 from decimal import Decimal
 from django import forms
@@ -14,7 +15,10 @@ from pretix.base.settings import settings_hierarkey
 from pretix.base.signals import (
     event_copy_data,
     item_copy_data,
+    order_changed,
     order_fee_calculation,
+    order_placed,
+    order_split,
 )
 from pretix.base.templatetags.money import money_filter
 from pretix.control.signals import item_forms, nav_event_settings
@@ -27,6 +31,10 @@ from pretix.presale.views import get_cart
 from pretix.presale.views.cart import cart_session
 
 from .models import FEE_MODE_ADD, FEE_MODE_INCLUDE, ItemServicefeesSettings
+from .position_fees import META_KEY_POSITION_FEES
+
+# Thread-local: per-position fee list (parallel to positions) for order_placed (Option A: meta_info).
+_pending_position_fees = threading.local()
 
 
 @receiver(nav_event_settings, dispatch_uid="service_fee_nav_settings")
@@ -57,7 +65,11 @@ def get_fees(
     positions=[],
     gift_cards=None,
     payment_requests=None,
+    for_order_creation=False,
 ):
+    if not for_order_creation:
+        _pending_position_fees.fees = None
+
     if request is not None and not positions:
         positions = get_cart(request)
 
@@ -176,6 +188,7 @@ def get_fees(
     product_fee_add_total = Decimal("0.00")
     product_fee_include_total = Decimal("0.00")
     include_position_fees = []  # (pos, rounded_line_fee) for price reduction
+    position_fee_values = [Decimal("0.00")] * len(all_positions)  # for reporting (Option A: meta_info)
     item_settings_map = {
         s.item_id: s
         for s in ItemServicefeesSettings.objects.filter(
@@ -186,7 +199,7 @@ def get_fees(
     default_percent = event.settings.get("service_fee_product_percent", as_type=Decimal) or Decimal("0.00")
     default_mode = event.settings.get("service_fee_product_mode", as_type=str) or FEE_MODE_ADD
 
-    for pos in all_positions:
+    for i, pos in enumerate(all_positions):
         item_setting = item_settings_map.get(pos.item_id)
         if item_setting is not None and (
             item_setting.fee_amount is not None
@@ -214,11 +227,14 @@ def get_fees(
         line_fee = (amount * qty) + (line_gross * percent / 100)
 
         if mode == FEE_MODE_ADD:
+            line_fee_rounded = round_decimal(line_fee, event.currency)
             product_fee_add_total += line_fee
+            position_fee_values[i] = line_fee_rounded
         else:
             # FEE_MODE_INCLUDE: use rounded per-position fee so sum(reductions) matches fee total
             line_fee_rounded = round_decimal(line_fee, event.currency)
             product_fee_include_total += line_fee_rounded
+            position_fee_values[i] = line_fee_rounded
             include_position_fees.append((pos, line_fee_rounded, line_gross, qty))
 
     product_fee_total = round_decimal(product_fee_add_total, event.currency) + product_fee_include_total
@@ -248,6 +264,9 @@ def get_fees(
                 tax_rule=tax_rule,
             )
         )
+
+    if for_order_creation:
+        _pending_position_fees.fees = position_fee_values
 
     # Reduce position prices by fee (before tax) for "included" mode so total stays correct
     for pos, line_fee_rounded, line_gross, qty in include_position_fees:
@@ -287,6 +306,7 @@ def cart_fee(sender: Event, request: HttpRequest, invoice_address, total, **kwar
         mod,
         request,
         payment_requests=kwargs.get("payment_requests"),
+        for_order_creation=False,
     )
 
 
@@ -315,7 +335,70 @@ def order_fee(
         positions=positions,
         gift_cards=gift_cards,
         payment_requests=kwargs.get("payment_requests"),
+        for_order_creation=True,
     )
+
+
+@receiver(order_placed, dispatch_uid="servicefees_order_placed")
+def order_placed_store_position_fees(sender, order, **kwargs):
+    """Store per-position service fee in order.meta_info for reporting (Option A).
+
+    Other plugins can read this via pretix_servicefees.position_fees.get_order_position_fees(order)
+    or order.meta_info[pretix_servicefees.position_fees.META_KEY_POSITION_FEES]. See
+    position_fees module docstring for the full contract.
+    """
+    pending = getattr(_pending_position_fees, "fees", None)
+    try:
+        if pending is None:
+            return
+        positions = list(order.positions.order_by("id"))
+        if len(pending) != len(positions):
+            return
+        fee_by_position = {}
+        for pos, fee in zip(positions, pending):
+            if fee > 0:
+                fee_by_position[str(pos.id)] = str(fee)
+        if not fee_by_position:
+            return
+        if order.meta_info is None:
+            order.meta_info = {}
+        order.meta_info[META_KEY_POSITION_FEES] = fee_by_position
+        order.save(update_fields=["meta_info"])
+    finally:
+        _pending_position_fees.fees = None
+
+
+@receiver(order_changed, dispatch_uid="servicefees_order_changed")
+def order_changed_clear_position_fees(sender, order, **kwargs):
+    """Clear per-position fee meta when order content changes.
+
+    After a material change we cannot recompute per-position fees for "included" mode,
+    so we remove the key. Other plugins will get an empty dict from get_order_position_fees().
+    """
+    if not order.meta_info or META_KEY_POSITION_FEES not in order.meta_info:
+        return
+    order.meta_info.pop(META_KEY_POSITION_FEES, None)
+    order.save(update_fields=["meta_info"])
+
+
+@receiver(order_split, dispatch_uid="servicefees_order_split")
+def order_split_update_position_fees(sender, original, split_order, **kwargs):
+    """Keep meta_info position fees only for positions still on each order.
+
+    Original order keeps fees for positions that stayed; split order does not get
+    fee data for moved positions (no mapping from old to new position ids).
+    """
+    for o in (original, split_order):
+        if not o.meta_info or META_KEY_POSITION_FEES not in o.meta_info:
+            continue
+        current_ids = {str(p.id) for p in o.positions.all()}
+        old_fees = o.meta_info.get(META_KEY_POSITION_FEES) or {}
+        new_fees = {pid: amt for pid, amt in old_fees.items() if pid in current_ids}
+        if new_fees != old_fees:
+            o.meta_info[META_KEY_POSITION_FEES] = new_fees if new_fees else None
+            if o.meta_info.get(META_KEY_POSITION_FEES) is None:
+                o.meta_info.pop(META_KEY_POSITION_FEES, None)
+            o.save(update_fields=["meta_info"])
 
 
 @receiver(front_page_top, dispatch_uid="service_fee_front_page_top")
