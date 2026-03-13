@@ -85,7 +85,10 @@ class ServiceFeeSettingsForm(SettingsForm):
             ("include", _("Included in the product price")),
         ),
         help_text=_(
-            "Added: the fee is shown as a separate line. Included: the product price already contains the fee; no extra line."
+            "Added: the fee is shown as a separate line. Included: the product price already contains the fee; "
+            "the fee still appears as a separate line in the cart and on the invoice, and the product line is "
+            "reduced by the fee amount (before tax) so the total stays the same. Set product prices to the all-in "
+            "price so the first page shows the correct amount including the fee."
         ),
         required=False,
     )

@@ -26,7 +26,7 @@ from pretix.presale.signals import (
 from pretix.presale.views import get_cart
 from pretix.presale.views.cart import cart_session
 
-from .models import FEE_MODE_ADD, ItemServicefeesSettings
+from .models import FEE_MODE_ADD, FEE_MODE_INCLUDE, ItemServicefeesSettings
 
 
 @receiver(nav_event_settings, dispatch_uid="service_fee_nav_settings")
@@ -171,8 +171,11 @@ def get_fees(
                 )
             )
 
-    # Per-product fee (amount + percent per line; "add" mode only adds an OrderFee)
-    product_fee_total = Decimal("0.00")
+    # Per-product fee (amount + percent per line). "add" mode adds an OrderFee; "include" mode
+    # also adds the fee line but reduces each position's price by its fee so the total is unchanged.
+    product_fee_add_total = Decimal("0.00")
+    product_fee_include_total = Decimal("0.00")
+    include_position_fees = []  # (pos, rounded_line_fee) for price reduction
     item_settings_map = {
         s.item_id: s
         for s in ItemServicefeesSettings.objects.filter(
@@ -200,7 +203,7 @@ def get_fees(
 
         if amount == Decimal("0.00") and percent == Decimal("0.00"):
             continue
-        if mode != FEE_MODE_ADD:
+        if mode not in (FEE_MODE_ADD, FEE_MODE_INCLUDE):
             continue
 
         qty = getattr(pos, "count", getattr(pos, "quantity", 1))
@@ -209,10 +212,18 @@ def get_fees(
         if line_gross is None:
             line_gross = getattr(pos, "price", Decimal("0.00")) * qty
         line_fee = (amount * qty) + (line_gross * percent / 100)
-        product_fee_total += line_fee
+
+        if mode == FEE_MODE_ADD:
+            product_fee_add_total += line_fee
+        else:
+            # FEE_MODE_INCLUDE: use rounded per-position fee so sum(reductions) matches fee total
+            line_fee_rounded = round_decimal(line_fee, event.currency)
+            product_fee_include_total += line_fee_rounded
+            include_position_fees.append((pos, line_fee_rounded, line_gross, qty))
+
+    product_fee_total = round_decimal(product_fee_add_total, event.currency) + product_fee_include_total
 
     if product_fee_total > Decimal("0.00"):
-        product_fee_total = round_decimal(product_fee_total, event.currency)
         tax_rule_zero = TaxRule.zero()
         tax_rule = (
             event.cached_default_tax_rule or tax_rule_zero
@@ -237,6 +248,14 @@ def get_fees(
                 tax_rule=tax_rule,
             )
         )
+
+    # Reduce position prices by fee (before tax) for "included" mode so total stays correct
+    for pos, line_fee_rounded, line_gross, qty in include_position_fees:
+        new_line_gross = line_gross - line_fee_rounded
+        new_price = round_decimal(new_line_gross / qty, event.currency)
+        pos.price = new_price
+        if hasattr(pos, "gross_price_before_rounding"):
+            pos.gross_price_before_rounding = new_line_gross
 
     return fees
 
